@@ -1,15 +1,29 @@
+#TO DO
+# button for screenshot
+# updatovat aby ruzova cara ve 3D attitude se menila pokud je selected baro nebo accel.
+# 2D attitude tak abych mohl zvetsovat zmensovat verrtikalni osu nezavisle na horizontalni.
+# zmenit napis position na 3D position
+# zmenit nazev Altitude vs time na Altitude
+# 2D attitude sirka neni stejna jako box 3D attitude nad ni
+# timestamp touchdown ve 3D position nedoshauje k lajne barometer altitude.
+# dat vpravo nahoru png "Kubfire" logo 
+# dat do leveho horniho rohu logo Speedy 2
+# dat deepresearchi at uklidi ten kod.
+
+
 import os
 import sys
 import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation as R
 import traceback
+import ctypes
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QSlider, QPushButton, QLabel, QFileDialog, 
-                             QSplitter, QComboBox, QCheckBox, QGroupBox)
+                             QSplitter, QComboBox, QCheckBox, QGroupBox, QStyleOptionSlider, QStyle)
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QIcon, QPainter, QColor, QFont
+from PyQt6.QtGui import QIcon, QPainter, QColor, QFont, QVector3D, QPen, QShortcut, QKeySequence
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
@@ -17,6 +31,36 @@ import pyqtgraph.opengl as gl
 # CONFIGURATION
 # ==========================================
 LOGO_FILENAME = r'C:\Users\kubfi\OneDrive\Documents\GitHub\Speedy2_Data_Analysis&Visualisation\visualisation\SPEEDY_LOGO_V2_red_lowres.png'
+
+# Fix taskbar icon on Windows
+try:
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('speedy2.visualiser.1.0')
+except Exception:
+    pass
+
+class MarkerSlider(QSlider):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.markers = []
+
+    def set_markers(self, markers):
+        self.markers = list(markers.keys())
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.markers or self.maximum() <= 0:
+            return
+        painter = QPainter(self)
+        painter.setPen(QPen(QColor("red"), 2))
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        rect = self.style().subControlRect(QStyle.ComplexControl.CC_Slider, opt, QStyle.SubControl.SC_SliderGroove, self)
+        
+        for m in self.markers:
+            frac = m / self.maximum()
+            x = rect.left() + int(frac * rect.width())
+            painter.drawLine(x, rect.top() + 2, x, rect.bottom() - 2)
 
 class TimelineLabels(QWidget):
     def __init__(self, parent=None):
@@ -46,12 +90,13 @@ class TimelineLabels(QWidget):
             x = margin + int((frame / self.total_frames) * track_w)
             painter.drawText(x - 15, 15, text)
 
+
 class RocketVisualizerGUI(QMainWindow):
     def __init__(self, df, file_path):
         super().__init__()
         self.setWindowTitle(f"Speedy 2 Flight Visualisation - {os.path.basename(file_path)}")
         self.setWindowIcon(QIcon(LOGO_FILENAME))
-        self.resize(1600, 950)
+        self.resize(1800, 1000)
 
         # State Variables
         self.is_playing = True
@@ -67,6 +112,9 @@ class RocketVisualizerGUI(QMainWindow):
 
         self.middle_mode = 'baro'
         self.right_mode = 'baro'
+        self.unwrap_angles = False
+        
+        self.event_markers_items = []
 
         # 1. Process Data
         self.process_data(df)
@@ -79,13 +127,16 @@ class RocketVisualizerGUI(QMainWindow):
         self.init_ui()
         self.update_ui_state()
 
+        # Global Spacebar Hotkey
+        self.shortcut_space = QShortcut(QKeySequence("Space"), self)
+        self.shortcut_space.activated.connect(self.toggle_play)
+
         # 4. Animation State
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(int(1000 / self.base_fps))
 
     def get_col_data(self, df, possible_names, default_val=0.0):
-        """Fuzzy column matcher: ignores case, spaces, and underscores."""
         df_cols_clean = [str(c).lower().replace(' ', '').replace('_', '') for c in df.columns]
         for name in possible_names:
             clean_name = str(name).lower().replace(' ', '').replace('_', '')
@@ -100,10 +151,15 @@ class RocketVisualizerGUI(QMainWindow):
         self.time_data, _ = self.get_col_data(df, ['time_s', 'Time_s', 'time'])
         self.frames_total = len(self.time_data)
         
-        # Check for Quaternions vs Euler
         if 'q_w' in df.columns and 'q_x' in df.columns:
             self.mode = 'quat'
             self.q_data = df[['q_x', 'q_y', 'q_z', 'q_w']].values
+            
+            # Generate eulers for the 2D plot
+            eulers = R.from_quat(self.q_data).as_euler('YXZ', degrees=True)
+            self.raw_yaw = np.radians(eulers[:, 0])
+            self.raw_pitch = np.radians(eulers[:, 1])
+            self.raw_roll = np.radians(eulers[:, 2])
         else:
             self.mode = 'euler'
             r, _ = self.get_col_data(df, ['euler_x_deg', 'Attitude_Roll_deg', 'roll'])
@@ -114,7 +170,8 @@ class RocketVisualizerGUI(QMainWindow):
             self.raw_pitch = np.radians(p)
             self.raw_yaw = np.radians(y)
 
-        # Extract States for Timeline
+        self.calculate_2d_attitude()
+
         self.state_data, _ = self.get_col_data(df, ['State', 'state'])
         self.state_markers = {}
         state_labels = {4: "Launch", 5: "Apogee", 6: "Chute", 7: "Touchdown"}
@@ -123,24 +180,18 @@ class RocketVisualizerGUI(QMainWindow):
             if len(idx) > 0:
                 self.state_markers[idx[0]] = s_name
 
-        # Position Extraction (Baro vs Fused)
         px, _ = self.get_col_data(df, ['pos_x', 'Pos_X_m', 'x'])
         py, _ = self.get_col_data(df, ['pos_y', 'Pos_Y_m', 'y'])
         
         pz_baro, found_baro = self.get_col_data(df, ['True Alt', 'Baro_Alt', 'Baro', 'baro_z'])
         pz_fused, found_fused = self.get_col_data(df, ['Pos_Z_m_Fused', 'pos_z', 'fused_z', 'Accel_Alt'])
-        
-        print(f"[DEBUG] Barometer Z column found: {found_baro}")
-        print(f"[DEBUG] Fused Z column found: {found_fused}")
 
-        # Only clone if a column is definitively missing, to prevent UI crashes
         if not found_baro and found_fused: pz_baro = pz_fused.copy()
         if not found_fused and found_baro: pz_fused = pz_baro.copy()
 
         self.pos_data_baro = np.column_stack((px, py, pz_baro))
         self.pos_data_fused = np.column_stack((px, py, pz_fused))
 
-        # Velocity Extraction
         vx, found_vx = self.get_col_data(df, ['vel_x'])
         vy, _ = self.get_col_data(df, ['vel_y'])
         vz, _ = self.get_col_data(df, ['vel_z'])
@@ -159,6 +210,15 @@ class RocketVisualizerGUI(QMainWindow):
         
         self.min_z_baro = np.nanmin(self.pos_data_baro[:, 2])
         self.min_z_fused = np.nanmin(self.pos_data_fused[:, 2])
+
+    def calculate_2d_attitude(self):
+        self.att_r_raw = np.degrees(self.raw_roll * self.inv_r)
+        self.att_p_raw = np.degrees(self.raw_pitch * self.inv_p)
+        self.att_y_raw = np.degrees(self.raw_yaw * self.inv_y)
+
+        self.att_r_unwrap = np.degrees(np.unwrap(np.radians(self.att_r_raw)))
+        self.att_p_unwrap = np.degrees(np.unwrap(np.radians(self.att_p_raw)))
+        self.att_y_unwrap = np.degrees(np.unwrap(np.radians(self.att_y_raw)))
 
     def build_rocket_geometry(self):
         lines = []
@@ -210,14 +270,14 @@ class RocketVisualizerGUI(QMainWindow):
         self.pre_pos_pitch_f = self.pos_data_fused[:, None, :] + np.einsum('vm,fcm->fvc', self.pos_vec_pitch_local, self.rot_matrices)
         self.pre_pos_yaw_f = self.pos_data_fused[:, None, :] + np.einsum('vm,fcm->fvc', self.pos_vec_yaw_local, self.rot_matrices)
 
-    def create_view_panel(self, title, view_widget, btn_home_callback, toggle_callback=None):
+    def create_view_panel(self, title, widget, btn_home_callback, toggle_callback=None):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(5, 5, 5, 5)
 
         header_layout = QHBoxLayout()
         lbl = QLabel(title)
-        lbl.setStyleSheet("font-weight: bold; font-size: 16px; color: #333;")
+        lbl.setStyleSheet("font-weight: bold; font-size: 16px; color: #EEEEEE;")
         header_layout.addWidget(lbl)
 
         if toggle_callback:
@@ -226,15 +286,17 @@ class RocketVisualizerGUI(QMainWindow):
             btn_toggle.clicked.connect(lambda: toggle_callback(btn_toggle))
             header_layout.addWidget(btn_toggle)
 
-            self.btn_middle_toggle = btn_toggle if 'Position' in title else getattr(self, 'btn_middle_toggle', None)
-            self.btn_right_toggle = btn_toggle if 'Altitude' in title else getattr(self, 'btn_right_toggle', None)
+            if 'Position' in title:
+                self.btn_middle_toggle = btn_toggle
+            elif 'Altitude' in title:
+                self.btn_right_toggle = btn_toggle
 
         btn_home = QPushButton("Home")
         btn_home.clicked.connect(btn_home_callback)
         header_layout.addWidget(btn_home)
         
         layout.addLayout(header_layout)
-        layout.addWidget(view_widget, stretch=1)
+        layout.addWidget(widget, stretch=1)
         return container
 
     def init_ui(self):
@@ -243,18 +305,22 @@ class RocketVisualizerGUI(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)
 
-        # Main Header Title
         title_lbl = QLabel("SPEEDY 2 FLIGHT VISUALISATION")
         title_lbl.setStyleSheet("color: red; font-size: 24px; font-weight: bold;")
         title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(title_lbl)
 
-        # -- Top Views Layout --
         self.view_splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(self.view_splitter, stretch=1)
 
-        # 1. Local Attitude
+        # =========================================
+        # 1. Left Panel (3D Attitude + 2D Attitude)
+        # =========================================
+        left_splitter = QSplitter(Qt.Orientation.Vertical)
+        
+        # 3D Attitude
         self.view_local = gl.GLViewWidget()
+        self.view_local.opts['center'] = QVector3D(0, 0, 0)
         self.view_local.opts['distance'] = 5
         
         self.gl_rocket = gl.GLLinePlotItem(color=(1, 1, 1, 1), mode='lines', width=2, antialias=True)
@@ -270,13 +336,64 @@ class RocketVisualizerGUI(QMainWindow):
         grid_local.scale(0.2, 0.2, 0.2)
         self.view_local.addItem(grid_local)
 
-        panel_local = self.create_view_panel("Attitude", self.view_local, self.home_local)
-        self.view_splitter.addWidget(panel_local)
+        panel_local = self.create_view_panel("3D Attitude", self.view_local, self.home_local)
+        left_splitter.addWidget(panel_local)
 
-        # 2. Global Position
+        # 2D Attitude
+        pg.setConfigOptions(antialias=True)
+        self.plot_att = pg.PlotWidget()
+        self.plot_att.setLabel('left', 'Angle (°)')
+        self.plot_att.setLabel('bottom', 'Time (s)')
+        self.plot_att.showGrid(x=True, y=True)
+        self.plot_att.addLegend(offset=(-10, 10))
+
+        self.curve_att_r = self.plot_att.plot(self.time_data, self.att_r_raw, pen=pg.mkPen('red', width=2), name="Roll")
+        self.curve_att_p = self.plot_att.plot(self.time_data, self.att_p_raw, pen=pg.mkPen('green', width=2), name="Pitch")
+        self.curve_att_y = self.plot_att.plot(self.time_data, self.att_y_raw, pen=pg.mkPen('blue', width=2), name="Yaw")
+        self.att_vline = pg.PlotDataItem(pen=pg.mkPen('red', width=2))
+        self.plot_att.addItem(self.att_vline)
+
+        # Attitude 2D Controls
+        att_control_widget = QWidget()
+        att_clayout = QHBoxLayout(att_control_widget)
+        att_clayout.setContentsMargins(0,0,0,0)
+        
+        self.chk_att_r = QCheckBox("Roll (R)")
+        self.chk_att_p = QCheckBox("Pitch (G)")
+        self.chk_att_y = QCheckBox("Yaw (B)")
+        self.chk_att_unwrap = QCheckBox("Unwrap Angles")
+        
+        self.chk_att_r.setChecked(True)
+        self.chk_att_p.setChecked(True)
+        self.chk_att_y.setChecked(True)
+
+        self.chk_att_r.stateChanged.connect(self.update_att_graph)
+        self.chk_att_p.stateChanged.connect(self.update_att_graph)
+        self.chk_att_y.stateChanged.connect(self.update_att_graph)
+        self.chk_att_unwrap.stateChanged.connect(self.update_att_graph)
+
+        for chk in [self.chk_att_r, self.chk_att_p, self.chk_att_y, self.chk_att_unwrap]:
+            chk.setStyleSheet("color: #EEEEEE;")
+            att_clayout.addWidget(chk)
+
+        att_container = QVBoxLayout()
+        att_container.addWidget(self.plot_att, stretch=1)
+        att_container.addWidget(att_control_widget)
+        
+        att_panel_widget = QWidget()
+        att_panel_widget.setLayout(att_container)
+        panel_att_2d = self.create_view_panel("2D Attitude", att_panel_widget, lambda: self.plot_att.autoRange())
+        left_splitter.addWidget(panel_att_2d)
+
+        self.view_splitter.addWidget(left_splitter)
+
+
+        # =========================================
+        # 2. Middle Panel (Global Position)
+        # =========================================
         self.view_global = gl.GLViewWidget()
+        self.view_global.opts['center'] = QVector3D(self.mids[0], self.mids[1], self.mids[2])
         self.view_global.opts['distance'] = self.max_range * 2.5
-        self.view_global.pan(self.mids[0], self.mids[1], self.mids[2])
 
         self.gl_path_baro = gl.GLLinePlotItem(pos=self.pos_data_baro, color=(1, 0.5, 0, 1.0), mode='line_strip', width=1.5)
         self.gl_path_fused = gl.GLLinePlotItem(pos=self.pos_data_fused, color=(0, 1, 1, 0.3), mode='line_strip', width=1.5)
@@ -297,8 +414,10 @@ class RocketVisualizerGUI(QMainWindow):
         panel_global = self.create_view_panel("Position", self.view_global, self.home_global, self.toggle_middle_alt)
         self.view_splitter.addWidget(panel_global)
 
-        # 3. Altitude Plot
-        pg.setConfigOptions(antialias=True)
+
+        # =========================================
+        # 3. Right Panel (Altitude 2D)
+        # =========================================
         self.plot_alt = pg.PlotWidget()
         self.plot_alt.setLabel('left', 'Altitude (m)')
         self.plot_alt.setLabel('bottom', 'Time (s)')
@@ -314,15 +433,19 @@ class RocketVisualizerGUI(QMainWindow):
         panel_alt = self.create_view_panel("Altitude vs Time", self.plot_alt, self.home_alt, self.toggle_right_alt)
         self.view_splitter.addWidget(panel_alt)
 
-        self.view_splitter.setSizes([500, 500, 500])
+        self.view_splitter.setSizes([500, 600, 500])
 
+        # Event Markers Initialization
+        self.setup_event_markers()
+
+        # =========================================
         # -- Control Panel Bottom --
+        # =========================================
         control_container = QWidget()
         control_layout = QVBoxLayout(control_container)
         control_layout.setContentsMargins(0, 5, 0, 0)
         main_layout.addWidget(control_container)
 
-        # Top Control Row
         settings_layout = QHBoxLayout()
         
         cam_group = QGroupBox("Camera Position")
@@ -335,7 +458,6 @@ class RocketVisualizerGUI(QMainWindow):
         self.btn_front.clicked.connect(lambda: self.set_camera(0, 90))
         self.btn_side.clicked.connect(lambda: self.set_camera(0, 0))
         for btn in [self.btn_top, self.btn_front, self.btn_side]:
-            btn.setStyleSheet("color: black; font-weight: normal;")
             cam_layout.addWidget(btn)
         settings_layout.addWidget(cam_group)
 
@@ -347,10 +469,9 @@ class RocketVisualizerGUI(QMainWindow):
         self.combo_seq.addItems(["ZYX", "XYZ", "YXZ", "ZXY", "XZY", "YZX"])
         self.combo_seq.setCurrentText(self.euler_seq)
         self.combo_seq.currentTextChanged.connect(self.on_euler_changed)
-        self.combo_seq.setStyleSheet("color: black; font-weight: normal;")
         
         lbl_seq = QLabel("Sequence:")
-        lbl_seq.setStyleSheet("color: black; font-weight: normal;")
+        lbl_seq.setStyleSheet("color: #EEEEEE;")
         euler_layout.addWidget(lbl_seq)
         euler_layout.addWidget(self.combo_seq)
         
@@ -362,14 +483,20 @@ class RocketVisualizerGUI(QMainWindow):
         self.chk_y.stateChanged.connect(self.on_euler_changed)
         
         for chk in [self.chk_r, self.chk_p, self.chk_y]:
-            chk.setStyleSheet("color: black; font-weight: normal;")
+            chk.setStyleSheet("color: #EEEEEE;")
             euler_layout.addWidget(chk)
             
         settings_layout.addWidget(self.euler_group)
+        
+        self.chk_markers = QCheckBox("Show Graph Event Markers")
+        self.chk_markers.setStyleSheet("color: #EEEEEE; font-weight: bold;")
+        self.chk_markers.setChecked(True)
+        self.chk_markers.stateChanged.connect(self.toggle_event_markers)
+        settings_layout.addWidget(self.chk_markers)
+
         settings_layout.addStretch()
         control_layout.addLayout(settings_layout)
 
-        # Timeline
         slider_wrapper = QVBoxLayout()
         slider_layout = QHBoxLayout()
         
@@ -377,7 +504,7 @@ class RocketVisualizerGUI(QMainWindow):
         lbl_tl.setStyleSheet("color: red; font-weight: bold;")
         slider_layout.addWidget(lbl_tl)
         
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider = MarkerSlider(Qt.Orientation.Horizontal)
         self.slider.setMinimum(0)
         self.slider.setMaximum(self.frames_total - 1)
         self.slider.setValue(0)
@@ -392,6 +519,7 @@ class RocketVisualizerGUI(QMainWindow):
 
         self.timeline_labels = TimelineLabels()
         self.timeline_labels.set_markers(self.state_markers, self.frames_total)
+        self.slider.set_markers(self.state_markers)
         
         lbl_spacer = QHBoxLayout()
         lbl_spacer.addSpacing(70) 
@@ -400,12 +528,24 @@ class RocketVisualizerGUI(QMainWindow):
         
         control_layout.addLayout(slider_wrapper)
 
-        # Bottom Tools
         btn_layout = QHBoxLayout()
+
+        self.btn_prev = QPushButton("◀")
+        self.btn_next = QPushButton("▶")
+        for b in [self.btn_prev, self.btn_next]:
+            b.setAutoRepeat(True)
+            b.setAutoRepeatDelay(400)
+            b.setAutoRepeatInterval(int(1000 / (self.base_fps * 0.25)))
+        self.btn_prev.clicked.connect(lambda: self.step_frame(-1))
+        self.btn_next.clicked.connect(lambda: self.step_frame(1))
+
         self.btn_play = QPushButton("Pause")
         self.btn_play.setStyleSheet("color: red; font-weight: bold;")
         self.btn_play.clicked.connect(self.toggle_play)
+        
+        btn_layout.addWidget(self.btn_prev)
         btn_layout.addWidget(self.btn_play)
+        btn_layout.addWidget(self.btn_next)
         
         self.btn_load = QPushButton("Load New File")
         self.btn_load.clicked.connect(self.load_new_file)
@@ -441,12 +581,66 @@ class RocketVisualizerGUI(QMainWindow):
 
         control_layout.addLayout(btn_layout)
 
+    def setup_event_markers(self):
+        self.event_markers_items = []
+        for idx in self.state_markers.keys():
+            t = self.time_data[idx]
+            
+            # Altitude 2D
+            la = pg.InfiniteLine(pos=t, angle=90, movable=False, pen=pg.mkPen(color='gray', width=1, style=Qt.PenStyle.DashLine))
+            self.plot_alt.addItem(la)
+            self.event_markers_items.append(la)
+            
+            # Attitude 2D
+            lt = pg.InfiniteLine(pos=t, angle=90, movable=False, pen=pg.mkPen(color='gray', width=1, style=Qt.PenStyle.DashLine))
+            self.plot_att.addItem(lt)
+            self.event_markers_items.append(lt)
+
+            # Global 3D Position
+            px, py, pz = self.pos_data_fused[idx]
+            line_3d = gl.GLLinePlotItem(pos=np.array([[px, py, self.min_z_fused], [px, py, pz + 100]]), color=(0.7, 0.7, 0.7, 0.8), width=1)
+            self.view_global.addItem(line_3d)
+            self.event_markers_items.append(line_3d)
+
+    def toggle_event_markers(self, state):
+        visible = bool(state)
+        for item in self.event_markers_items:
+            item.setVisible(visible)
+
+    def update_att_graph(self):
+        self.unwrap_angles = self.chk_att_unwrap.isChecked()
+        
+        r_data = self.att_r_unwrap if self.unwrap_angles else self.att_r_raw
+        p_data = self.att_p_unwrap if self.unwrap_angles else self.att_p_raw
+        y_data = self.att_y_unwrap if self.unwrap_angles else self.att_y_raw
+
+        self.curve_att_r.setData(self.time_data, r_data)
+        self.curve_att_p.setData(self.time_data, p_data)
+        self.curve_att_y.setData(self.time_data, y_data)
+        
+        self.curve_att_r.setVisible(self.chk_att_r.isChecked())
+        self.curve_att_p.setVisible(self.chk_att_p.isChecked())
+        self.curve_att_y.setVisible(self.chk_att_y.isChecked())
+        
+        self.plot_att.autoRange()
+
+    def step_frame(self, amount):
+        if self.is_playing:
+            self.toggle_play()
+        
+        self.current_frame = np.clip(self.current_frame + amount, 0, self.frames_total - 1)
+        self.slider.blockSignals(True)
+        self.slider.setValue(self.current_frame)
+        self.slider.blockSignals(False)
+        self.render_frame()
+
     def home_local(self):
+        self.view_local.opts['center'] = QVector3D(0, 0, 0)
         self.view_local.setCameraPosition(distance=5, elevation=30, azimuth=45)
 
     def home_global(self):
+        self.view_global.opts['center'] = QVector3D(self.mids[0], self.mids[1], self.mids[2])
         self.view_global.setCameraPosition(distance=self.max_range * 2.5, elevation=30, azimuth=45)
-        self.view_global.pan(self.mids[0], self.mids[1], self.mids[2])
 
     def home_alt(self):
         self.plot_alt.autoRange()
@@ -495,7 +689,9 @@ class RocketVisualizerGUI(QMainWindow):
         self.inv_r = -1 if self.chk_r.isChecked() else 1
         self.inv_p = -1 if self.chk_p.isChecked() else 1
         self.inv_y = -1 if self.chk_y.isChecked() else 1
+        self.calculate_2d_attitude()
         self.calculate_rotations()
+        self.update_att_graph()
         self.render_frame()
 
     def toggle_play(self):
@@ -547,7 +743,7 @@ class RocketVisualizerGUI(QMainWindow):
 
         t = self.time_data[frame]
         
-        # Snaps precisely to the currently active Mode curve
+        # Altitude 2D Marker Update
         if self.right_mode == 'baro':
             active_z = self.pos_data_baro[frame, 2]
             base_z = self.min_z_baro
@@ -556,6 +752,11 @@ class RocketVisualizerGUI(QMainWindow):
             base_z = self.min_z_fused
             
         self.alt_vline.setData(x=[t, t], y=[base_z, active_z])
+
+        # Attitude 2D Marker Update
+        y_min, y_max = self.plot_att.viewRange()[1]
+        self.att_vline.setData(x=[t, t], y=[y_min, y_max])
+
         self.lbl_status.setText(f"Flight Time: {t:.2f}s | Frame: {frame}/{self.frames_total}")
 
     def load_new_file(self):
@@ -565,6 +766,16 @@ class RocketVisualizerGUI(QMainWindow):
         if file_path:
             self.timer.stop()
             try:
+                # Remove old markers
+                for item in self.event_markers_items:
+                    try:
+                        self.plot_alt.removeItem(item)
+                        self.plot_att.removeItem(item)
+                        self.view_global.removeItem(item)
+                    except:
+                        pass
+                self.event_markers_items.clear()
+
                 if file_path.endswith('.csv'):
                     df = pd.read_csv(file_path)
                 else:
@@ -573,11 +784,14 @@ class RocketVisualizerGUI(QMainWindow):
                 
                 self.process_data(df)
                 self.build_rocket_geometry()
+                self.calculate_2d_attitude()
                 self.calculate_rotations()
+                self.update_att_graph()
                 
                 self.update_ui_state()
                 self.slider.setMaximum(self.frames_total - 1)
                 self.timeline_labels.set_markers(self.state_markers, self.frames_total)
+                self.slider.set_markers(self.state_markers)
 
                 self.middle_mode = 'baro'
                 self.right_mode = 'baro'
@@ -586,12 +800,16 @@ class RocketVisualizerGUI(QMainWindow):
 
                 self.gl_path_baro.setData(pos=self.pos_data_baro, color=(1, 0.5, 0, 1.0))
                 self.gl_path_fused.setData(pos=self.pos_data_fused, color=(0, 1, 1, 0.3))
+                self.view_global.opts['center'] = QVector3D(self.mids[0], self.mids[1], self.mids[2])
                 self.home_global()
                 
                 self.curve_baro.setData(self.time_data, self.pos_data_baro[:, 2], pen=pg.mkPen('orange', width=2))
                 self.curve_fused.setData(self.time_data, self.pos_data_fused[:, 2], pen=pg.mkPen('cyan', width=1, style=Qt.PenStyle.DashLine))
                 self.home_alt()
                 
+                self.setup_event_markers()
+                self.toggle_event_markers(self.chk_markers.isChecked())
+
                 self.setWindowTitle(f"Speedy 2 Flight Visualisation - {os.path.basename(file_path)}")
                 self.current_frame = 0
                 self.timer.start()
